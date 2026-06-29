@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-Script untuk menggabungkan gambar/PDF dari folder ke dalam dokumen Word.
-- Auto-deteksi tipe file (image/pdf)
+Script untuk menggabungkan gambar/PDF/Word dari folder ke dalam dokumen Word.
+- Auto-deteksi tipe file (image/pdf/docx)
+- Convert PDF/Word → image (screenshot halaman pertama)
 - Ukuran gambar: 70% dari aslinya
 - Header 1: "Lampiran"
+- Scan recursive subfolder
 """
 import os
 import sys
-import glob
-from pathlib import Path
+import tempfile
 from docx import Document
 from docx.shared import Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from PIL import Image
-import tempfile
 
 try:
     from pdf2image import convert_from_path
     PDF_SUPPORT = True
 except ImportError:
     PDF_SUPPORT = False
-    print("Warning: pdf2image tidak terinstall. PDF tidak akan diproses.")
+    print("Warning: pdf2image tidak terinstall. PDF/Word tidak akan diproses.")
     print("Install dengan: pip install pdf2image")
 
 
@@ -31,79 +31,137 @@ def create_lampiran_header(doc, num, name):
     return header
 
 
-def embed_image(doc, image_path, size_percent=0.7):
+def embed_image_from_file(doc, image_path, size_percent=0.5):
     """Embed image dengan ukuran 70% dari aslinya"""
     try:
         img = Image.open(image_path)
-
-        # Hitung ukuran baru (70%)
         width, height = img.size
         new_width = int(width * size_percent)
         new_height = int(height * size_percent)
-
-        # Resize gambar
         img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
-        # Simpan ke temporary file
         with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
             img_resized.save(tmp.name, 'PNG')
             temp_path = tmp.name
 
-        # Insert ke docx
         doc.add_paragraph()
-        # Konversi pixel ke inches (96 DPI standard)
         width_inches = new_width / 96.0
         doc.add_picture(temp_path, width=Inches(min(width_inches, 6.5)))
         doc.add_paragraph()
 
-        # Hapus temporary file
         os.remove(temp_path)
         return True
-
     except Exception as e:
-        print(f"Error embedding image {image_path}: {e}")
+        print(f"  Error embedding image {image_path}: {e}")
+        return False
+
+
+def convert_pdf_to_image(pdf_path, output_image_path):
+    """Convert PDF ke image (halaman pertama)"""
+    if not PDF_SUPPORT:
+        return False
+
+    try:
+        pages = convert_from_path(pdf_path, dpi=150, first_page=1, last_page=1)
+        if pages:
+            pages[0].save(output_image_path, 'PNG')
+            return True
+        return False
+    except Exception as e:
+        print(f"  Error converting PDF to image: {e}")
+        return False
+
+
+def convert_word_to_pdf(word_path, pdf_path):
+    """Extract text from Word dan convert ke simple PDF (fallback tanpa LibreOffice)"""
+    try:
+        doc = Document(word_path)
+
+        # Buat PDF document baru
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.pagesizes import letter
+
+        c = canvas.Canvas(pdf_path, pagesize=letter)
+        width, height = letter
+        y = height - 40
+
+        # Tulis text dari paragraf
+        for para in doc.paragraphs:
+            if para.text.strip():
+                c.drawString(40, y, para.text[:80])  # Limit text length
+                y -= 20
+                if y < 40:
+                    c.showPage()
+                    y = height - 40
+
+        c.save()
+        return True
+    except ImportError:
+        print(f"  reportlab tidak terinstall. Install dengan: pip install reportlab")
+        return False
+    except Exception as e:
+        print(f"  Error converting Word to PDF: {e}")
         return False
 
 
 def embed_pdf(doc, pdf_path, size_percent=0.7):
-    """Embed PDF sebagai screenshot halaman pertama"""
-    if not PDF_SUPPORT:
-        print(f"Skip PDF (tidak ada pdf2image): {pdf_path}")
-        return False
+    """Embed PDF sebagai image (screenshot halaman pertama)"""
+    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+        temp_img = tmp.name
+
+    if convert_pdf_to_image(pdf_path, temp_img):
+        success = embed_image_from_file(doc, temp_img, size_percent)
+        if os.path.exists(temp_img):
+            os.remove(temp_img)
+        return success
+
+    if os.path.exists(temp_img):
+        os.remove(temp_img)
+    return False
+
+
+def embed_word(doc, word_path, size_percent=0.7):
+    """Embed Word sebagai image (convert → PDF → image)"""
+    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_pdf:
+        temp_pdf = tmp_pdf.name
+
+    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_img:
+        temp_img = tmp_img.name
 
     try:
-        # Convert PDF ke images (ambil halaman pertama)
-        pages = convert_from_path(pdf_path, dpi=150, first_page=1, last_page=1)
-
-        if not pages:
+        # Convert Word → PDF
+        if not convert_word_to_pdf(word_path, temp_pdf):
             return False
 
-        page = pages[0]
-        width, height = page.size
-        new_width = int(width * size_percent)
-        new_height = int(height * size_percent)
+        # Convert PDF → image
+        if convert_pdf_to_image(temp_pdf, temp_img):
+            success = embed_image_from_file(doc, temp_img, size_percent)
+            return success
 
-        # Resize
-        img_resized = page.resize((new_width, new_height), Image.Resampling.LANCZOS)
-
-        # Simpan ke temporary file
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-            img_resized.save(tmp.name, 'PNG')
-            temp_path = tmp.name
-
-        # Insert ke docx
-        doc.add_paragraph()
-        width_inches = new_width / 96.0
-        doc.add_picture(temp_path, width=Inches(min(width_inches, 6.5)))
-        doc.add_paragraph()
-
-        # Hapus temporary file
-        os.remove(temp_path)
-        return True
-
-    except Exception as e:
-        print(f"Error embedding PDF {pdf_path}: {e}")
         return False
+    finally:
+        if os.path.exists(temp_pdf):
+            os.remove(temp_pdf)
+        if os.path.exists(temp_img):
+            os.remove(temp_img)
+
+
+def scan_files_recursive(folder_path):
+    """Scan recursive semua file image/pdf/docx"""
+    image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tiff',
+                  'JPG', 'JPEG', 'PNG', 'GIF', 'BMP', 'TIFF'}
+    pdf_exts = {'pdf', 'PDF'}
+    word_exts = {'docx', 'DOCX', 'doc', 'DOC'}
+
+    all_files = []
+
+    for root, dirs, files in os.walk(folder_path):
+        for f in files:
+            ext = f.rsplit('.', 1)[-1] if '.' in f else ''
+            if ext in image_exts or ext in pdf_exts or ext in word_exts:
+                all_files.append(os.path.join(root, f))
+
+    return sorted(all_files)
 
 
 def process_folder(folder_path, output_file='dokumentasi_penelitian.docx'):
@@ -113,54 +171,38 @@ def process_folder(folder_path, output_file='dokumentasi_penelitian.docx'):
         print(f"Error: Folder tidak ditemukan: {folder_path}")
         return
 
-    # Buat dokumen baru
     doc = Document()
     doc.add_heading('Dokumentasi Penelitian', level=0)
     doc.add_paragraph()
 
-    # Temukan semua file
-    image_extensions = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'tiff', 'JPG', 'JPEG', 'PNG', 'GIF', 'BMP', 'TIFF']
-    pdf_extensions = ['pdf', 'PDF']
-
-    all_files = []
-
-    # Scan untuk images
-    for ext in image_extensions:
-        pattern = os.path.join(folder_path, f'*.{ext}')
-        all_files.extend(glob.glob(pattern))
-
-    # Scan untuk PDFs
-    for ext in pdf_extensions:
-        pattern = os.path.join(folder_path, f'*.{ext}')
-        all_files.extend(glob.glob(pattern))
-
-    # Sort berdasarkan nama file
-    all_files = sorted(set(all_files))
+    all_files = scan_files_recursive(folder_path)
 
     if not all_files:
-        print(f"Tidak ada file gambar atau PDF ditemukan di: {folder_path}")
+        print(f"Tidak ada file gambar, PDF, atau Word ditemukan di: {folder_path}")
         return
 
-    print(f"Ditemukan {len(all_files)} file untuk diproses...")
+    print(f"Ditemukan {len(all_files)} file untuk diproses...\n")
 
     lampiran_num = 1
     success_count = 0
 
     for file_path in all_files:
+        rel_path = os.path.relpath(file_path, folder_path)
         filename = os.path.basename(file_path)
-        extension = file_path.lower().split('.')[-1]
+        ext = file_path.rsplit('.', 1)[-1].lower() if '.' in file_path else ''
 
-        print(f"Memproses [{lampiran_num}]: {filename}")
+        print(f"Memproses [{lampiran_num}]: {rel_path}")
 
-        # Buat header lampiran
         create_lampiran_header(doc, lampiran_num, filename)
 
-        # Embed berdasarkan tipe file
-        if extension in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'tiff']:
-            success = embed_image(doc, file_path)
-        elif extension == 'pdf':
+        if ext in ('jpg', 'jpeg', 'png', 'gif', 'bmp', 'tiff'):
+            success = embed_image_from_file(doc, file_path)
+        elif ext == 'pdf':
             success = embed_pdf(doc, file_path)
+        elif ext in ('docx', 'doc'):
+            success = embed_word(doc, file_path)
         else:
+            print(f"  Skip: tipe file tidak dikenal")
             success = False
 
         if success:
@@ -168,7 +210,6 @@ def process_folder(folder_path, output_file='dokumentasi_penelitian.docx'):
 
         lampiran_num += 1
 
-    # Simpan dokumen
     doc.save(output_file)
     print(f"\n{'='*50}")
     print(f"Dokumen Word berhasil dibuat: {output_file}")
